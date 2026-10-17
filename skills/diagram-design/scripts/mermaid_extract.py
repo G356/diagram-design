@@ -271,22 +271,28 @@ def load_blocks(path: Path) -> list[SourceBlock]:
     start: int | None = None
     fence = ""
     content: list[str] = []
+    capture = False
     for line_number, line in enumerate(lines, 1):
         if start is None:
-            match = re.match(r"^\s*(`{3,}|~{3,})\s*mermaid\s*$", line, re.I)
-            if match:
+            match = re.match(r"^\s*(`{3,}|~{3,})(.*)$", line)
+            if (match and not (match.group(1)[0] == "`" and "`" in match.group(2))
+                    and (match.group(2).strip().casefold() == "mermaid"
+                         or re.match(r"^ {0,3}[`~]", line))):
                 start = line_number + 1
                 fence = match.group(1)
+                capture = match.group(2).strip().casefold() == "mermaid"
                 content = []
             continue
-        if re.match(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$", line):
-            blocks.append(SourceBlock(len(blocks), "\n".join(content), start))
+        if (re.match(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$", line)
+                and (capture or re.match(r"^ {0,3}[`~]", line))):
+            if capture:
+                blocks.append(SourceBlock(len(blocks), "\n".join(content), start))
             start = None
             fence = ""
             content = []
-        else:
+        elif capture:
             content.append(line)
-    if start is not None:
+    if start is not None and capture:
         _fail(f"{path.name}: unterminated mermaid fence starting at line {start - 1}")
     if not blocks:
         _fail(f"{path.name}: no fenced mermaid block found")
@@ -639,6 +645,9 @@ class _Operator:
 
 
 def _operator_style(token: str) -> tuple[str, str, bool, bool]:
+    if token.startswith("~"):
+        # `A ~~~ B` is an invisible link: it only places B near A.
+        return "invisible", "none", False, True
     style = "dashed" if "." in token else "thick" if "=" in token else "solid"
     arrowhead = "cross" if token.endswith("x") else "circle" if token.endswith("o") else "arrow"
     undirected = ">" not in token and not token.endswith(("x", "o"))
@@ -686,7 +695,7 @@ def _edge_operators(text: str) -> list[_Operator]:
         r"(?P<closing>\.-+[>xo]|\.-+)"
     )
     trailing_operator = re.compile(
-        r"(?:\.-+[>xo]|\.-+|-{2,}>|--[xo]|=+>|={2,}|-{3,})"
+        r"(?:\.-+[>xo]|\.-+|-{2,}>|--[xo]|=+>|={2,}|-{3,}|~{3,})"
         r"(?:\|[^|\n]*\|)?\s*$"
     )
     for edge_pattern in (text_edge, dotted_edge):
@@ -723,7 +732,7 @@ def _edge_operators(text: str) -> list[_Operator]:
             occupied.append((operator_start, match.end()))
 
     pattern = re.compile(
-        r"[xo][-=.]+[xo]|<[-=.]+>|-+\.-+>|=+>|-+(?:>|x|o)|-+\.-+|={3,}|-{3,}"
+        r"[xo][-=.]+[xo]|<[-=.]+>|-+\.-+>|=+>|-+(?:>|x|o)|-+\.-+|={3,}|-{3,}|~{3,}"
     )
     for match in pattern.finditer(mask):
         if any(start <= match.start() < end for start, end in occupied):
@@ -731,10 +740,15 @@ def _edge_operators(text: str) -> list[_Operator]:
         token = match.group()
         end = match.end()
         label = ""
-        if end < len(text) and text[end] == "|":
-            close = text.find("|", end + 1)
+        # Mermaid allows whitespace between the link and its pipe label:
+        # `A --> |yes| B` reads the same as `A -->|yes| B`.
+        opening_pipe = end
+        while opening_pipe < len(text) and text[opening_pipe] in " \t":
+            opening_pipe += 1
+        if opening_pipe < len(text) and text[opening_pipe] == "|":
+            close = text.find("|", opening_pipe + 1)
             if close != -1:
-                label = clean_label(text[end + 1 : close])
+                label = clean_label(text[opening_pipe + 1 : close])
                 end = close + 1
         style, arrowhead, bidirectional, undirected = _operator_style(token)
         operators.append(
@@ -778,6 +792,7 @@ def _parse_flowchart(
     diagram: Diagram, lines: list[tuple[int, str]], header_position: int
 ) -> None:
     containers: list[str] = []
+    invisible_links = 0
     for line_number, raw in _logical_statements(lines[header_position + 1 :]):
         text = raw.strip()
         if not text:
@@ -824,6 +839,11 @@ def _parse_flowchart(
                 _fail(f"malformed edge at line {line_number}")
             valid_groups = [group for group in groups if group is not None]
             for index, operator in enumerate(operators):
+                if operator.style == "invisible":
+                    # The endpoints were declared above; the link itself is a
+                    # layout hint with no meaning of its own.
+                    invisible_links += 1
+                    continue
                 for source in valid_groups[index]:
                     for target in valid_groups[index + 1]:
                         diagram.add_edge(
@@ -842,12 +862,16 @@ def _parse_flowchart(
         if parsed is not None:
             node_id, label, shape = parsed
             diagram.add_node(node_id, label, shape, parent)
+    if invisible_links:
+        diagram.notes.append(f"{invisible_links} invisible layout links ignored")
 
 
 def _parse_sequence(
     diagram: Diagram, lines: list[tuple[int, str]], header_position: int
 ) -> None:
-    fragment_stack: list[dict[str, Any]] = []
+    # None marks a visual-only rect block: its end must not close a semantic fragment.
+    fragment_stack: list[dict[str, Any] | None] = []
+    semantic_depth = 0
     participant_re = re.compile(
         r"^(?:create\s+)?(participant|actor)\s+"
         r"(?:\"([^\"]+)\"|'([^']+)'|([\w.:-]+))"
@@ -890,25 +914,30 @@ def _parse_sequence(
                 "actor" if kind == "actor" else "lifeline",
             )
             continue
+        if (re.match(r"^rect\s+", text, re.I) and message_re.match(text) is None
+                and re.match(r"^rect\s+(?:<<--?>>|--?>>|--?>|--?\)|--?x)", text, re.I) is None):
+            fragment_stack.append(None)
+            continue
         fragment = re.match(r"^(alt|opt|loop|par|critical|break)\b\s*(.*)$", text, re.I)
         if fragment:
             entry = {
                 "kind": fragment.group(1).casefold(),
                 "label": clean_label(fragment.group(2)),
                 "line": line_number,
-                "depth": len(fragment_stack),
+                "depth": semantic_depth,
                 "regions": [],
             }
             diagram.fragments.append(entry)
             fragment_stack.append(entry)
+            semantic_depth += 1
             continue
         region = re.match(r"^(else|and|option)\b\s*(.*)$", text, re.I)
-        if region and fragment_stack:
+        if region and fragment_stack and fragment_stack[-1] is not None:
             fragment_stack[-1]["regions"].append(clean_label(region.group(2)))
             continue
         if lowered == "end":
-            if fragment_stack:
-                fragment_stack.pop()
+            if fragment_stack and fragment_stack.pop() is not None:
+                semantic_depth -= 1
             continue
         if lowered.startswith(("activate ", "deactivate ", "+", "-")):
             continue
@@ -995,7 +1024,10 @@ def _parse_state(
         if note:
             # A colon marks a single-line note; otherwise ignore its opaque body
             # through `end note` before interpreting states, edges or braces.
-            note_start = line_number if note.group(1) is None else None
+            if note.group(1) is None:
+                note_start = line_number
+            else:
+                diagram.notes.append(clean_label(note.group(1)))
             continue
         if _discard_nonsemantic(diagram, text):
             continue

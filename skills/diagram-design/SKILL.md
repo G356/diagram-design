@@ -53,7 +53,7 @@ Use for any of the 45 visual types (§3) when a reader will learn more from a vi
 
 **Don't use for:**
 
-- Quick unicode diagrams → use **wiretext**.
+- Quick unicode diagrams → a separate plain-text tool such as wiretext. This skill doesn't ship one.
 - Lists of things → table or bullets.
 - Attribute-only before/after → table; topology changes → Architecture delta.
 - One-shape "diagrams" → just write the sentence.
@@ -84,7 +84,7 @@ The pattern owns semantic primitives and its tighter budget; the type owns layou
 
 | If you're showing… | Use | Reference |
 |---|---|---|
-| Components + connections in one system snapshot | **Architecture** | [type-architecture.md](references/type-architecture.md) |
+| Components + connections in one snapshot; nested admin vs traffic scopes | **Architecture** | [type-architecture.md](references/type-architecture.md) |
 | Structural change between synchronized Before / After topologies, with a Changes ledger | **Architecture delta** | [type-architecture-delta.md](references/type-architecture-delta.md) |
 | Legacy IT landscape by phase or department; shows the *before* state | **IT current-state** | [type-it-state.md](references/type-it-state.md) |
 | Decision logic with branches | **Flowchart** | [type-flowchart.md](references/type-flowchart.md) |
@@ -297,7 +297,7 @@ Run before producing any diagram.
 - [ ] `viewBox` expanded for the legend strip (~60px)?
 - [ ] **`min-width` equals the viewBox width, and the SVG sits in a local `overflow-x: auto` wrapper? (Otherwise a phone scrolls the whole page — or an `overflow: hidden` ancestor clips the diagram with no scrollbar at all. See [output-spec.md](references/output-spec.md).)**
 - [ ] Node origins, dimensions, gaps, padding on the 4px grid; type sizes on the role ramp?
-- [ ] From the installed skill directory, did `python3 scripts/self_check.py <file>` pass? (Accessible-SVG contract, single-file safety, motion basics.)
+- [ ] From the installed skill directory, did `python3 scripts/self_check.py <file>` pass? (Accessible-SVG contract, single-file safety, content inside the viewBox, motion basics.)
 - [ ] If animated, does the complete static/no-JS frame work, does reduced motion hide/disable playback, and is the controller copied verbatim from `assets/template-motion.html`? From a repository checkout, also run `python3 <repo-root>/scripts/verify-motion.py path/to/generated.html` plus the skin linter; from an installed skill, manually check print and static-query states on top of the self-check.
 
 **Typography:**
@@ -389,6 +389,6 @@ Every diagram is an accessible figure by default (long form: [primitives-core.md
 
 ### Exporting to PNG / SVG
 
-When the user asks to export, save, rasterize, or convert a generated diagram to `.png` or `.svg`, load [`references/export.md`](references/export.md) and follow the procedure there. For the SVG half, prefer the packaged helper `scripts/export_svg.py` (it carries class-based CSS into the fragment and namespaces `<defs>` IDs so exports stay inline-safe). Both formats deliver the diagram only (the `<svg>` node) — editorial wrappers like cards and headers are dropped by design. Export is **manual** — never produce export files unprompted.
+When the user asks to export, save, rasterize, or convert a generated diagram to `.png` or `.svg`, load [`references/export.md`](references/export.md) and follow the procedure there. Run the packaged helpers `scripts/export_svg.py` and `scripts/export_png.py`; the reference owns their arguments and availability checks. Both formats deliver the diagram only (the `<svg>` node) — editorial wrappers like cards and headers are dropped by design. Export is **manual** — never produce export files unprompted.
 
 For an imported diagram, pixel dimensions come from the `viewBox` × scale factor, so its size decision belongs to §11, not to export. For any diagram that needs an exact frame (an OG card or a slide image), see [`export.md` § Sizing the export](references/export.md).

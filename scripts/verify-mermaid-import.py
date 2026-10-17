@@ -579,6 +579,56 @@ A --> B
     ok("frontmatter is skipped, and an unterminated block still fails specifically")
 
 
+def check_outer_markdown_fences(tmp: Path) -> None:
+    for name, opening, closing in [
+        ("backtick", "````markdown", "````"),
+        ("tilde", "~~~markdown", "~~~"),
+        ("unlabelled", "````", "````"),
+        ("longer-close", "````markdown", "`````"),
+        ("three-space-indent", "   ````markdown", "   ````"),
+    ]:
+        path = tmp / f"outer-fence-{name}.md"
+        path.write_text(opening + "\n```mermaid\npie title Literal example\n```\n" + closing
+                        + "\n\n```mermaid\nflowchart TD\nA --> B\n```\n", encoding="utf-8")
+        payload = json.loads(run_extract([str(path), "--diagram", "all", "--json"]))
+        if payload["diagrams_total"] != 1 or len(payload["diagrams"]) != 1:
+            fail(f"{name}: literal Mermaid sample was counted as a live block")
+        diagram = payload["diagrams"][0]
+        if diagram["kind"] != "flowchart" or {n["id"] for n in diagram["nodes"]} != {"A", "B"}:
+            fail(f"{name}: live flowchart was not preserved")
+    mixed = tmp / "outer-fence-live-controls.md"
+    mixed.write_text("~~~text\n```mermaid\npie title Literal\n```\n~~~\n"
+                     "``` MeRmAiD  \nflowchart LR\nC --> D\n````\n"
+                     "~~~mermaid\nflowchart TD\nE --> F\n~~~~\n", encoding="utf-8")
+    payload = json.loads(run_extract([str(mixed), "--diagram", "all", "--json"]))
+    if payload["diagrams_total"] != 2 or [d["kind"] for d in payload["diagrams"]] != ["flowchart", "flowchart"]:
+        fail("live mixed-case/whitespace and tilde fences did not retain their order")
+    if [{n["id"] for n in d["nodes"]} for d in payload["diagrams"]] != [{"C", "D"}, {"E", "F"}]:
+        fail("ordinary fence contents leaked into live diagram nodes")
+    selected = json.loads(run_extract([str(mixed), "--diagram", "1", "--json"]))
+    if {n["id"] for n in selected["diagrams"][0]["nodes"]} != {"E", "F"}:
+        fail("selection counted literal samples instead of live Mermaid blocks")
+    expect_error([str(mixed), "--diagram", "2"], "no diagram with index 2 (have 0..1)")
+    indented = tmp / "outer-fence-indented-example.md"
+    indented.write_text("    ```text\n\n```mermaid\nflowchart TD\nA --> B\n```\n", encoding="utf-8")
+    payload = json.loads(run_extract([str(indented), "--json"]))
+    if {node["id"] for node in payload["diagrams"][0]["nodes"]} != {"A", "B"}:
+        fail("indented code example hid the following live Mermaid block")
+    indented.write_text("```text\n    ```\nstill inside\n```\n\n```mermaid\nflowchart TD\nA --> B\n```\n", encoding="utf-8")
+    payload = json.loads(run_extract([str(indented), "--json"]))
+    if {node["id"] for node in payload["diagrams"][0]["nodes"]} != {"A", "B"}:
+        fail("indented closing fence ended an ordinary block early")
+    # Existing Mermaid indentation remains supported, including four spaces.
+    indented.write_text("    ```mermaid\nflowchart TD\nA --> B\n    ```\n", encoding="utf-8")
+    payload = json.loads(run_extract([str(indented), "--json"]))
+    if {node["id"] for node in payload["diagrams"][0]["nodes"]} != {"A", "B"}:
+        fail("existing indented Mermaid support changed")
+    unclosed = tmp / "outer-fence-unclosed.md"
+    unclosed.write_text("````markdown\n```mermaid\nflowchart TD\nA --> B\n```\n", encoding="utf-8")
+    expect_error([str(unclosed)], "no fenced mermaid block found")
+    ok("outer code fences keep Mermaid samples literal and preserve live block order")
+
+
 def check_markdown_and_grammars(tmp: Path) -> None:
     header = run_extract([str(README_FIXTURE)])
     if "2 diagram(s)" not in header or "[1] sequenceDiagram" not in header:
@@ -855,6 +905,60 @@ def check_adversarial(tmp: Path) -> None:
     if "&lt;img src=" not in digest_text or "&gt;" not in digest_text:
         fail("decoded HTML label was not safely encoded in Markdown output")
     ok("adversarial labels stay inert; nesting, chains, fan-out, discards work")
+
+
+def check_sequence_highlight_nesting_regression(tmp: Path) -> None:
+    cases = [
+        ("named-color-highlight", "rect lightblue\nA->>B: highlighted\nend", [], ["highlighted"]),
+        ("hex-color-highlight", "rect #ffccaa\nA->>B: highlighted\nend", [], ["highlighted"]),
+        ("variable-color-highlight", "rect var(--x)\nA->>B: highlighted\nend", [], ["highlighted"]),
+        ("highlight-inside-alt", "alt success\nrect rgb(200, 200, 200)\nrect rgba(0, 0, 255, .1)\nA->>B: highlighted\nend\nend\nelse failure\nA->>B: rejected\nend", [("alt", "success", 0, ["failure"])], ["highlighted", "rejected"]),
+        ("alt-inside-highlight", "rect rgb(200, 200, 200)\nalt success\nloop retries\nA->>B: attempt\nend\nelse failure\nA->>B: rejected\nend\nend", [("alt", "success", 0, ["failure"]), ("loop", "retries", 1, [])], ["attempt", "rejected"]),
+        ("ordinary-fragment-control", "alt success\nloop retries\nA->>B: attempt\nend\nelse failure\nA->>B: rejected\nend", [("alt", "success", 0, ["failure"]), ("loop", "retries", 1, [])], ["attempt", "rejected"]),
+    ]
+    for name, body, expected_fragments, expected_messages in cases:
+        scene = tmp / ("sequence-highlight-nesting-" + name + ".mmd")
+        scene.write_text("sequenceDiagram\nparticipant A\nparticipant B\n" + body + "\n", encoding="utf-8")
+        diagram = json.loads(run_extract([str(scene), "--json"]))["diagrams"][0]
+        actual = [(fragment["kind"], fragment["label"], fragment["depth"], fragment["regions"]) for fragment in diagram["fragments"]]
+        if actual != expected_fragments:
+            fail(f"{name}: semantic fragment nesting changed: {actual!r}")
+        if [edge["label"] for edge in diagram["edges"]] != expected_messages:
+            fail(f"{name}: messages changed while ignoring highlighting")
+        if [(node["id"], node["label"]) for node in diagram["nodes"]] != [("A", "A"), ("B", "B")]:
+            fail(f"{name}: highlighting introduced or renamed participants")
+    # Preserve an already accepted message source whose ID happens to be rect.
+    participant = tmp / "sequence-highlight-rect-participant.mmd"
+    participant.write_text("sequenceDiagram\nparticipant rect\nparticipant B\nrect ->>B: preserved\n", encoding="utf-8")
+    diagram = json.loads(run_extract([str(participant), "--json"]))["diagrams"][0]
+    if [(edge["source"], edge["target"], edge["label"]) for edge in diagram["edges"]] != [("rect", "B", "preserved")]:
+        fail("rect participant message was mistaken for visual highlighting")
+    if diagram["fragments"]:
+        fail("rect participant message introduced a semantic fragment")
+    malformed = tmp / "sequence-highlight-malformed-rect.mmd"
+    malformed.write_text("sequenceDiagram\nrect ->>: missing target\n", encoding="utf-8")
+    expect_error([str(malformed)], "malformed edge at line 2")
+    # Count actual depth-reduction work instead of relying on machine timing.
+    extractor = load_extractor_module()
+    for depth in (100, 200):
+        visits = [0]
+
+        def counted_sum(values, start=0):
+            total = start
+            for value in values:
+                visits[0] += 1
+                total += value
+            return total
+
+        extractor.sum = counted_sum
+        text = "rect rgb(0, 0, 0)\nopt nested\n" * depth + "A->>B: deepest\n" + "end\nend\n" * depth
+        diagram = extractor.Diagram(0, "sequenceDiagram", 1)
+        extractor._parse_sequence(diagram, list(enumerate(("sequenceDiagram\n" + text).splitlines(), 1)), 0)
+        if [fragment["depth"] for fragment in diagram.fragments] != list(range(depth)):
+            fail("deep highlight blocks changed semantic fragment depth")
+        if visits[0] > len(text):
+            fail(f"sequence fragment depth rescanned nested stacks: {visits[0]} visits")
+    ok("sequence highlight blocks preserve semantic fragment regions and depth")
 
 
 def check_sequence_grammar_forms(tmp: Path) -> None:
@@ -1170,6 +1274,57 @@ def check_node_shape_updates(tmp: Path) -> None:
     ok("node declarations update shapes while bare references preserve them")
 
 
+def check_invisible_links(tmp: Path) -> None:
+    flow = tmp / "invisible-links.mmd"
+    flow.write_text("flowchart TD\nJ ~~~ K\nP --> Q ~~~ R\n", encoding="utf-8")
+    diagram = json.loads(run_extract([str(flow), "--json"]))["diagrams"][0]
+    if sorted(node["id"] for node in diagram["nodes"]) != ["J", "K", "P", "Q", "R"]:
+        fail("endpoints of an invisible link must still become nodes")
+    if [(edge["source"], edge["target"]) for edge in diagram["edges"]] != [("P", "Q")]:
+        fail("an invisible link must not become an edge")
+    if diagram["notes"] != ["2 invisible layout links ignored"]:
+        fail(f"invisible links must be reported: {diagram['notes']!r}")
+    ok("invisible ~~~ links declare their nodes without becoming edges")
+
+    for endpoint in ("x", "o"):
+        for operator, style in (("--go-->", "solid"), ("==go==>", "thick"), ("-.go.->", "dashed")):
+            for invisible in ("~~~", "~~~~"):
+                flow.write_text(f"flowchart TD\nA {invisible} {endpoint}{operator}B\n", encoding="utf-8")
+                mixed = json.loads(run_extract([str(flow), "--json"]))["diagrams"][0]
+                if {node["id"] for node in mixed["nodes"]} != {"A", endpoint, "B"}:
+                    fail("an invisible link must preserve a following x/o endpoint")
+                edges = [(edge["source"], edge["target"], edge["label"], edge["style"])
+                         for edge in mixed["edges"]]
+                if edges != [(endpoint, "B", "go", style)]:
+                    fail(f"mixed invisible/labeled chain changed its visible edge: {edges!r}")
+                if mixed["notes"] != ["1 invisible layout links ignored"]:
+                    fail("mixed invisible/labeled chains must report only their layout link")
+
+    flow.write_text("flowchart TD\nA ~~~ x--go-->B ~~~ o-.next.->C\n", encoding="utf-8")
+    mixed = json.loads(run_extract([str(flow), "--json"]))["diagrams"][0]
+    if {node["id"] for node in mixed["nodes"]} != {"A", "x", "B", "o", "C"}:
+        fail("a repeated mixed chain must preserve every endpoint")
+    if [(edge["source"], edge["target"], edge["label"]) for edge in mixed["edges"]] != [
+        ("x", "B", "go"), ("o", "C", "next")
+    ] or mixed["notes"] != ["2 invisible layout links ignored"]:
+        fail("a repeated mixed chain must retain both labeled edges and no invisible edges")
+    ok("invisible links keep x/o endpoint identity in solid, thick, dotted and repeated chains")
+
+
+def check_spaced_pipe_labels(tmp: Path) -> None:
+    flow = tmp / "spaced-pipe-labels.mmd"
+    flow.write_text(
+        "flowchart TD\nA --> |solid| B\nB -.-> |dotted| C\nC ==> |thick| D\nD --- |plain| E\nE -->|tight| F\n",
+        encoding="utf-8",
+    )
+    diagram = json.loads(run_extract([str(flow), "--json"]))["diagrams"][0]
+    edges = [(edge["source"], edge["target"], edge["label"]) for edge in diagram["edges"]]
+    expected = [("A", "B", "solid"), ("B", "C", "dotted"), ("C", "D", "thick"), ("D", "E", "plain"), ("E", "F", "tight")]
+    if edges != expected:
+        fail(f"a pipe label after whitespace must stay a label: {edges!r}")
+    ok("pipe labels may follow whitespace after the link operator")
+
+
 def check_unicode_state_regression(tmp: Path) -> None:
     path = tmp / "unicode-state.mmd"
     path.write_text('stateDiagram-v2\n待机 : 等待输入\n待机 --> 完成\n', encoding="utf-8")
@@ -1254,13 +1409,19 @@ def check_standalone_state_regression(tmp: Path) -> None:
     notes.write_text(
         "stateDiagram-v2\nstate Idle\nnote left of Idle\nGhost\nend note\n"
         "note right of Idle\nPhantom\nend note\n"
-        "note left of Idle: inline annotation\n"
-        "note right of Idle: inline annotation\nActive\nnote\nend\nnotebook\n",
+        "note left of Idle: first inline annotation\n"
+        "note right of Idle: second inline annotation\nActive\nnote\nend\nnotebook\n",
         encoding="utf-8",
     )
     payload = json.loads(run_extract([str(notes), "--json"]))["diagrams"][0]
     if {node["id"] for node in payload["nodes"]} != {"Idle", "Active", "note", "end", "notebook"}:
         fail("State note boundaries swallowed real states or retained annotation bodies")
+
+    if payload["notes"] != ["first inline annotation", "second inline annotation"]:
+        fail("Single-line state notes were not retained in source order")
+    digest = run_extract([str(notes)])
+    if "notes: first inline annotation; second inline annotation" not in digest:
+        fail("Single-line state notes were not printed in the digest")
 
     for side in ("left", "right"):
         unterminated = tmp / f"state-note-unterminated-{side}.mmd"
@@ -1296,9 +1457,12 @@ def main() -> int:
         check_flowchart()
         check_bidirectional_analysis(tmp)
         check_node_shape_updates(tmp)
+        check_invisible_links(tmp)
+        check_spaced_pipe_labels(tmp)
         check_entity_label_codes(tmp)
         check_shape_and_edge_vocabulary(tmp)
         check_frontmatter(tmp)
+        check_outer_markdown_fences(tmp)
         check_markdown_and_grammars(tmp)
         check_state_descriptions(tmp)
         check_named_composite_states(tmp)
@@ -1306,6 +1470,7 @@ def main() -> int:
         check_utf8_bom(tmp)
         check_legacy_stdout_encoding(tmp)
         check_sequence_grammar_forms(tmp)
+        check_sequence_highlight_nesting_regression(tmp)
         check_adversarial(tmp)
         check_errors_and_limits(tmp)
         check_docs_and_wiring()
